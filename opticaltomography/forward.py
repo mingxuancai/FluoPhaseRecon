@@ -105,16 +105,19 @@ class Multislice:
         # self._scattering_obj = self._opticsmodel[model](self.phase_obj_3d, **self.scat_model_args)
 
     def forward(self, obj, device='cpu'):
-        forward_scattered_predict = []
+        forward_scattered_predict = torch.zeros(self.number_illum, 200, 200)
+        # print("1:{}".format(torch.cuda.memory_allocated(0)))
 
         for illu_idx in range(self.number_illum):  # number of emitting sources
             fx_source = self.fx_illu_list[illu_idx]
             fy_source = self.fy_illu_list[illu_idx]
             fz_source_layer = self.fz_illu_list[illu_idx]
             fields = self._forwardMeasure(fx_source, fy_source, fz_source_layer, obj=obj, device=device)
+            # print("n:{}".format(torch.cuda.memory_allocated(0)))
 
             # get only absolute value of fields
-            forward_scattered_predict.append(fields)
+            forward_scattered_predict[illu_idx,:,:] = fields
+            # print("2:{}".format(torch.cuda.memory_allocated(0)))
 
         # forward_scattered_predict = np.array(forward_scattered_predict).tranpose(2, 3, 1, 0)  # why?
         # forward_scattered_predict = np.array(forward_scattered_predict)
@@ -128,6 +131,7 @@ class Multislice:
         obj: obj to be passed through
         """
         Nz = obj.shape[2]
+        obj = obj.to(device)
 
         # setup prop focus kernel
         # check if the prop distance is correct
@@ -135,7 +139,7 @@ class Multislice:
 
         # MultiPhaseContrast, solves directly for the phase contrast
         # {i.e. Transmittance = exp(sigma * PhaseContrast)}
-        self.transmittance = torch.exp(1.0j * self.sigma * obj)
+        self.transmittance = torch.exp(1.0j * self.sigma * obj).to(device)
 
         # Compute Forward: multislice propagation
         # u: ifftshifted; complex64; numpy
@@ -144,16 +148,21 @@ class Multislice:
 
         # propagation without interaction with object, the value is measured from experimental data
         # Q: why should it be 48?
-        u = self._propagationAngular(u, 48 * self.slice_separation[0], test=True)
-        u = u * np.exp(1.0j * 2.0 * np.pi * fz_illu * self.initial_z_position)
+        # print("0:{}".format(torch.cuda.memory_allocated(0)))
+        u = self._propagationAngular(u, 48 * self.slice_separation[0], test=True, device=device)
+        # print("0:{}".format(torch.cuda.memory_allocated(0)))
+        u *= np.exp(1.0j * 2.0 * np.pi * fz_illu * self.initial_z_position)
 
         # Multislice
         for zz in range(Nz):
 
-            u = self.transmittance[:, :, zz] * u
+            u *= self.transmittance[:, :, zz]
+            # print("1:{}".format(torch.cuda.memory_allocated(0)))
 
             if zz < obj.shape[2] - 1:
-                u = self._propagationAngular(u, self.slice_separation[zz])
+                u = self._propagationAngular(u, self.slice_separation[zz], device=device)
+                
+            # print("2:{}".format(torch.cuda.memory_allocated(0)))
                 # u = self.propkern.to(device) * u
 
         # Focus
@@ -162,7 +171,7 @@ class Multislice:
 
         # Microscope's Point Spread Function (estimate the pupil's defocus)
         u = torch.fft.fft2(u)
-        u = self.pupil.to(device) * u
+        u *= self.pupil.to(device)
         u = torch.fft.ifft2(u)
 
         # Camera Intensity Measurement
@@ -242,7 +251,7 @@ class Multislice:
         pupil_radius = na/wavelength
         pupil = (self.uxx**2 + self.uyy**2 <= pupil_radius**2)
         pupil_mask = (self.uxx**2 + self.uyy**2 <= torch.max(self.uxx)**2)
-        pupil = pupil * pupil_mask
+        pupil *= pupil_mask
         pupil = torch.fft.ifftshift(pupil)
 
         return pupil.to(device)
@@ -255,20 +264,24 @@ class Multislice:
         propagation_distance:   distance to propagate the wave
         self.prop_kernel_phase: shifted
         """
+        
         self.prop_kernel_phase = self.prop_kernel_phase.to(device)
-        if test:
-            self.test.append(field)
+        
+        # if test:
+            # self.test.append(field)
         field = torch.fft.fft2(field)
-        if test:
-            self.test.append(field)
+        
+        # if test:
+            # self.test.append(field)
         if prop_distance > 0:
-            field[:, :] = field[:, :] * torch.exp(self.prop_kernel_phase * prop_distance)
+            field[:, :] *= torch.exp(self.prop_kernel_phase * prop_distance)
+            
         else:
-            field[:, :] = field[:, :] * torch.conj(torch.exp(self.prop_kernel_phase * torch.abs(prop_distance)))
+            field[:, :] *= torch.conj(torch.exp(self.prop_kernel_phase * torch.abs(prop_distance)))
 
         field = torch.fft.ifft2(field)
-
-        return field
+        
+        return field.to(device)
 
     """
     def propKernel(self, prop_distance, RI=1.0, band_limited=True, device='cpu'):
