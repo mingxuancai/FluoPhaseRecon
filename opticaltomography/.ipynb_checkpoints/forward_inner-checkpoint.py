@@ -95,6 +95,7 @@ class Multislice:
 
         self.test = []
         self.test_spherical = []
+        self.test_final = []
 
     def setScatteringMethod(self, model="MultiPhaseContrast"):
         # Define Scattering method for tomography
@@ -145,8 +146,10 @@ class Multislice:
 
         # propagation without interaction with object, the value is measured from experimental data
         # assume free space between the sample and beads
-        # u = self._propagationAngular(u, 48 * self.slice_separation[0], test=True, device=device)
+        # u = self._propagationAngular_pad(u, 48 * self.slice_separation[0], test=True, device=device)
         # self.test.append(u)
+
+        # u *= np.exp(1.0j * 2.0 * np.pi * fz_illu * self.initial_z_position)
 
         # Multislice
         for zz in range(Nz):
@@ -156,28 +159,42 @@ class Multislice:
 
             if zz < obj.shape[2] - 1:
                 u = self._propagationAngular_pad(u, self.slice_separation[zz], device=device)
+                
+            # print("2:{}".format(torch.cuda.memory_allocated(0)))
+                # u = self.propkern.to(device) * u
 
         # Focus
         if obj.shape[2] > 1:
             u = self._propagationAngular_pad(u, torch.tensor(-1 * self.ps_z * ((Nz-1)/2)), device=device)
+            # u = self._propagationAngular(u, -1 * self.ps_z * ((Nz-1)/2).type(ctype))
+    
+        # u *= np.exp(1.0j * 2.0 * np.pi * fz_illu * self.initial_z_position)
+        # u = self._propagationAngular(u, torch.tensor(self.initial_z_position), device=device)
         
         # Microscope's Point Spread Function (estimate the pupil's defocus)
-        # should be padding
+        self.test_final.append(u)
         u = self._systemPupilconstraint(u, device=device)
+        
+        """
+        u = torch.fft.fft2(u)
+        u *= self.pupil.to(device)
+        u = torch.fft.ifft2(u)
+        """
 
         # Camera Intensity Measurement
         est_intensity = torch.abs(u)
-        est_intensity = torch.fft.fftshift(est_intensity)
+        # est_intensity = torch.fft.ifftshift(est_intensity)
         est_intensity = est_intensity * est_intensity
+        
         return est_intensity
     
-    def _systemPupilconstraint(self, field, pupil=None, pad = 100, device='cpu'):
+    def _systemPupilconstraint(self, field, pupil=None, pad = 1000, device='cpu'):
         self.pupil = self.pupil.to(device)
         pupil_pad = torch.zeros(self.shape[1]+2*pad, self.shape[0]+2*pad, dtype=torch.complex128)
-        pupil_pad[pad:self.shape[1]+pad, pad:self.shape[0]+pad] = self.pupil
+        pupil_pad[pad:self.shape[1]+pad, pad:self.shape[0]+pad] = torch.fft.fftshift(self.pupil)
         
         field_pad = torch.zeros(self.shape[0]+2*pad, self.shape[1]+2*pad, dtype=torch.complex128)
-        field_pad[pad:self.shape[1]+pad, pad:self.shape[0]+pad] = field
+        field_pad[pad:self.shape[1]+pad, pad:self.shape[0]+pad] = torch.fft.fftshift(field)
         
         field_pad = torch.fft.fft2(field_pad)
         field_pad *= pupil_pad
@@ -187,20 +204,21 @@ class Multislice:
         
         return field_non_pad.to(device)
 
-    def _genSphericalWave(self, fx_source, fy_source, device='cpu'):
+    def _genSphericalWave(self, fx_source, fy_source, device='cpu', pad=50):
         # ifftshifted
         fx_source, fy_source = self._setIlluminationOnGrid(fx_source, fy_source)
         fz_source = self.RI/self.wavelength
 
         # spherical wave at z = 0
-        r = ((self.xx_shifted-fx_source*self.shape[1])**2+(self.yy_shifted-fy_source*self.shape[0])**2)**0.5
-        
+        r = ((self.xx_shifted-fx_source*self.shape[1])**2+(self.yy_shifted-fy_source*self.shape[0])**2+(self.ps_z*0)**2)**0.5
+
         r_nonzero = r
         r_nonzero[r_nonzero < 1e-5 ] = 1  # prevent divide by zero
         
         source_xy = torch.exp(1.0j * 2.0 * np.pi / self.wavelength * r_nonzero)/r_nonzero
         # set the zero value (center coordinate) to 10
-        # source_xy[source_xy == torch.exp(torch.tensor(1.0j * 2.0 * np.pi / self.wavelength))] = 1 # set to 1 now
+        source_xy[source_xy == torch.exp(torch.tensor(1.0j * 2.0 * np.pi / self.wavelength))] = 1 # set to 1 now s 
+        # source_xy[torch.abs(source_xy) > 10] = 1
 
         return source_xy.to(device), fx_source, fy_source, fz_source
 
@@ -237,7 +255,7 @@ class Multislice:
         pupil = torch.fft.ifftshift(pupil)
 
         return pupil.to(device)
-    
+
     def _propagationAngular_pad(self, field, prop_distance, test=False, device='cpu', pad = 100):
         """
         propagation operator that uses angular spectrum to propagate the wave
@@ -245,28 +263,16 @@ class Multislice:
         field:                  input field: shifted
         propagation_distance:   distance to propagate the wave
         self.prop_kernel_phase: shifted
-        """
+        """    
         
-        field = torch.fft.ifftshift(field)
         self.prop_kernel_phase = self.prop_kernel_phase.to(device)
         prop_kernel_padding = torch.zeros(self.shape[0]+2*pad, self.shape[1]+2*pad, dtype=torch.complex128)
-        # print(prop_kernel_padding.shape)
-        prop_kernel_padding[pad:self.shape[0]+pad, pad:self.shape[0]+pad] = self.prop_kernel_phase
-        # print(self.prop_kernel_phase)
-        # print(prop_kernel_padding[pad:self.shape[0]+pad, pad:self.shape[0]+pad])
+        prop_kernel_padding[pad:self.shape[0]+pad, pad:self.shape[0]+pad] = torch.fft.fftshift(self.prop_kernel_phase)
         
         field_pad = torch.zeros(self.shape[0]+2*pad, self.shape[1]+2*pad, dtype=torch.complex128)
-        # print(field_pad.shape)
-        field_pad[pad:self.shape[0]+pad, pad:self.shape[0]+pad] = field
-        # print(field)
-        # print(field_pad[pad:self.shape[0]+pad, pad:self.shape[0]+pad])
+        field_pad[pad:self.shape[0]+pad, pad:self.shape[0]+pad] = field = torch.fft.fftshift(field)
         
-        # if test:
-            # self.test.append(field)
         field_pad = torch.fft.fft2(field_pad)
-        
-        # if test:
-            # self.test.append(field)
         if prop_distance > 0:
             field_pad[:, :] *= torch.exp(prop_kernel_padding * prop_distance)
             
@@ -279,7 +285,7 @@ class Multislice:
         # print(field_non_pad.shape)
         
         return field_non_pad.to(device)
-
+    
     def _propagationAngular(self, field, prop_distance, test=False, device='cpu'):
         """
         propagation operator that uses angular spectrum to propagate the wave
@@ -307,30 +313,6 @@ class Multislice:
         
         return field.to(device)
 
-    """
-    def propKernel(self, prop_distance, RI=1.0, band_limited=True, device='cpu'):
-        urr = self.uxx**2 + self.uyy**2
-        # print(urr)
-        urr = urr.numpy()
-
-        if band_limited:
-            # Pcrop type: torch
-            Pcrop = torch.fft.fftshift(self.pupil)
-        else:
-            Pcrop = 1.0
-
-        # prop_kernel type: torch
-        # prop_kernel: not shifted; i dont think prop_kernel should shift
-        kern = ((RI/self.wavelength)**2 - urr)
-        kern[kern < 0] = 0
-        # print(np.max(kern))
-        prop_kernel = Pcrop * np.exp(1.0j * 2.0 * np.pi * abs(prop_distance) * Pcrop * kern**0.5)
-        # print(urr)
-        # print(Pcrop)
-        # if z<0, backpropagation
-        prop_kernel = torch.conj(prop_kernel) if prop_distance < 0 else prop_kernel
-        return prop_kernel.to(device)
-        """
 
 
 
