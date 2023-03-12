@@ -107,9 +107,13 @@ class Multislice:
             self._x = self.phase_obj_3d.contrast_obj
         # self._scattering_obj = self._opticsmodel[model](self.phase_obj_3d, **self.scat_model_args)
 
-    def forward(self, obj, device='cpu'):
+    def forward(self, obj, source_est=None, joint=False, device='cpu'):
         forward_scattered_predict = torch.zeros(self.number_illum, self.shape[0], self.shape[1])
-        # print("1:{}".format(torch.cuda.memory_allocated(0)))
+        
+        if joint:
+            self.fx_illu_list = source_est[1]
+            self.fy_illu_list = source_est[0]
+            self.fz_illu_list = source_est[2]
 
         for illu_idx in range(self.number_illum):  # number of emitting sources
             fx_source = self.fx_illu_list[illu_idx]
