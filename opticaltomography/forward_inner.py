@@ -138,7 +138,7 @@ class Multislice:
         fields = torch.fft.fft2(fields)
         
         # Step 4: System limitation
-        fields *= self.pupil.to(device)
+        fields *= self.pupil
         
         fields = torch.fft.fftshift(fields)
         self.fields_test = fields
@@ -156,7 +156,7 @@ class Multislice:
         fx_source, fy_source, fz_source: source position in x, y, z
         obj: obj to be passed through
         """
-        obj = obj.to(device)
+        obj = obj
 
         self.transmittance = torch.exp(1.0j * self.sigma * obj).to(device)
 
@@ -200,22 +200,27 @@ class Multislice:
 
         # Compute Forward: multislice propagation
         # u: ifftshifted; complex64; numpy
-        u, _, _, fz_illu = self._genSphericalWave(fx_source, fy_source, fz_source, device=device, prop_distance=self.ps_z*1) # initial field
+        u, _, _, fz_illu = self._genSphericalWave(fx_source, fy_source, fz_source, prop_distance=self.ps_z*1) # initial field
+        # u, _, _, fz_illu = self._genSphericalWave_old(fx_source, fy_source) # initial field
 
-        # self.test_spherical.append(u)
+        self.test_spherical.append(u)
         u = u.to(device)
         
         # u = self._propagationAngular(u, 48 * self.slice_separation[0], test=True, device=device)
 
         # Multislice
+        
         if fz_source != 0:
             Nz -= (np.ceil(fz_source))
             Nz = int(Nz)
+        
             
         for zz in range(Nz):
+            
             if fz_source != 0:
                 zz = zz + np.ceil(fz_source)
                 zz = int(zz)
+            
             u *= self.transmittance[:, :, zz]
 
             if zz < obj.shape[2] - 1:
@@ -252,6 +257,23 @@ class Multislice:
         field = field_pad[pad:pad_upper, pad:pad_upper]
         
         return field
+    
+    def _genSphericalWave_old(self, fx_source, fy_source, device='cpu'):
+        # ifftshifted
+        fx_source, fy_source = self._setIlluminationOnGrid(fx_source, fy_source)
+        fz_source = self.RI/self.wavelength
+
+        # spherical wave at z = 0
+        r = ((self.xx_shifted-fx_source*self.shape[1])**2+(self.yy_shifted-fy_source*self.shape[0])**2)**0.5
+        
+        r_nonzero = r
+        r_nonzero[r_nonzero < 1e-5 ] = 1  # prevent divide by zero
+        
+        source_xy = torch.exp(1.0j * 2.0 * np.pi / self.wavelength * r_nonzero)/r_nonzero
+        # set the zero value (center coordinate) to 10
+        # source_xy[source_xy == torch.exp(torch.tensor(1.0j * 2.0 * np.pi / self.wavelength))] = 1 # set to 1 now
+
+        return source_xy.to(device), fx_source, fy_source, fz_source
 
     def _genSphericalWave(self, fx_source, fy_source, fz_depth, prop_distance=0, device='cpu'):
         """
@@ -260,15 +282,15 @@ class Multislice:
         # ifftshifted
         # do not need to adjust the coordinate
         fx_source, fy_source = self._setIlluminationOnGrid(fx_source, fy_source)
-        
         fz_source = self.RI/self.wavelength
         # fz_source = (self.RI/self.wavelength)**2 - self.uxx_shifted**2 - self.uyy_shifted**2
         
         # avoid the problem of divided by 0 when generating spherical wave
         # since we will not put the sources near the surface
+        
         if fz_depth != 0:
             dz_prop_distance = self.ps_z + (np.ceil(fz_depth)-fz_depth) * self.ps_z # compute the spherical wave at the next slice (thin)
-            r = ((self.xx_shifted-fx_source*self.shape[1])**2+(self.yy_shifted-fy_source*self.shape[0])**2+dz_prop_distance**2)**0.5     
+            r = ((self.xx_shifted-fx_source*self.shape[1])**2+(self.yy_shifted-fy_source*self.shape[0])**2+dz_prop_distance**2)**0.5
     
         else:  # set the source at a certain distance from the bottom of the sample
             r = ((self.xx_shifted-fx_source*self.shape[1])**2+(self.yy_shifted-fy_source*self.shape[0])**2+prop_distance**2)**0.5
