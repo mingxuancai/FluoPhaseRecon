@@ -1,11 +1,24 @@
-import matplotlib.pyplot as plt
-from ipywidgets import interact, IntSlider
+import numpy
 
-def showimgstack(img, num):
-    f, axes = plt.subplots(1, 1, figsize=(10, 6))
-    frames = []
-
-    frames.append(axes.imshow(img[0]))
-    axes.set_title('filled in phantom')
-
-    interact(frames[0].set_data(img[i]), i=IntSlider(min=0, max=num-1, step=1, value=0))
+def coordinate_transform(fx_source, fy_source, shape_size):
+    middle = shape_size//2
+    fx_source *= middle
+    fy_source *= middle
+    print(fx_source)
+    if fx_source >= 0:
+        if fy_source >= 0: # region 4
+            fx_source -= middle
+            fy_source -= middle
+        else: # region 3
+            fx_source -= middle
+            fy_source += middle
+    else:
+        if fy_source >= middle: # region 2
+            fx_source += middle
+            fy_source -= middle
+        else: # region 1
+            fx_source += middle
+            fy_source += middle
+    # print(fx_source/shape_size)
+    # print(fy_source/shape_size)
+    return fx_source/shape_size, fy_source/shape_size

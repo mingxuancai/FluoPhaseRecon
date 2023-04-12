@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import sys
+from opticaltomography.utils import coordinate_transform
 
 dtype = torch.float32
 np_dtype = np.float32
@@ -24,7 +25,7 @@ class PhaseObject3D:
         self.pixel_size = voxel_size[0]
         self.pixel_size_z = voxel_size[2]
 
-        self.slice_separation = self.pixel_size_z * torch.ones((shape[2]-1,), dtype=dtype)
+        self.slice_separation = self.pixel_size_z * torch.ones((shape[2],), dtype=dtype)
 
     def convertRItoPhaseContrast(self):
         self.contrast_obj = self.RI_obj - self.RI
@@ -65,6 +66,7 @@ class Multislice:
         # unshifted
         self.xx, self.yy, self.uxx, self.uyy = self.sampling()
         self.xx_shifted = torch.fft.ifftshift(self.xx)
+        # print(self.xx_shifted)
         self.yy_shifted = torch.fft.ifftshift(self.yy)
         self.uxx_shifted = torch.fft.ifftshift(self.uxx)
         self.uyy_shifted = torch.fft.ifftshift(self.uyy)
@@ -93,7 +95,7 @@ class Multislice:
         # back propagate shape_z // 2
         self.initial_z_position = -1 * (self.shape[2]//2) * self.ps_z
 
-        self.test = []
+        # self.test = []
         self.test_spherical = []
         self.test_final = []
         self.test_prop = []
@@ -107,85 +109,21 @@ class Multislice:
             self._x = self.phase_obj_3d.contrast_obj
         # self._scattering_obj = self._opticsmodel[model](self.phase_obj_3d, **self.scat_model_args)
 
-    def forward(self, obj, device='cpu'):
+    def forward(self, obj, wl_coef=1.0, device='cpu'):
         forward_scattered_predict = torch.zeros(self.number_illum, self.shape[0], self.shape[1])
 
         for illu_idx in range(self.number_illum):  # number of emitting sources
             fx_source = self.fx_illu_list[illu_idx]
             fy_source = self.fy_illu_list[illu_idx]
             fz_source_layer = self.fz_illu_list[illu_idx]
-            fields = self._forwardMeasure(fx_source, fy_source, fz_source_layer, obj=obj, device=device)
+            fields = self._forwardMeasure(fx_source, fy_source, fz_source_layer, obj=obj, wl_coef=wl_coef, device=device)
 
             # get only absolute value of fields
             forward_scattered_predict[illu_idx,:,:] = fields
 
         return forward_scattered_predict, fields
-    
-    def predictSLM(self, fx, fy, fz, obj, focal_length, device='cpu'):
-        """
-        Simulate the wave propagation through the reconstructed sample.
-        Get the corresponding SLM pattern for phase conjugation.
-        focal_length: should be negtive for back propagation
-        """
-        
-        # Step 1: create source field for propagation and get the exit field
-        fields = self._forwardMeasure_amp(fx, fy, fz, obj=obj, device=device)
-        
-        # Step 2: Phase conjugate the field and focus at the distance (-focal length)
-        fields = self._propagationAngular(torch.conj(fields), torch.tensor(-focal_length), device=device)
-        
-        # Step 3: Fourier transform to obtain wavefront at the SLM plane
-        fields = torch.fft.fft2(fields)
-        
-        # Step 4: System limitation
-        fields *= self.pupil
-        
-        fields = torch.fft.fftshift(fields)
-        self.fields_test = fields
-        
-        # Step 5: Mapping to SLM
-        SLM_field = torch.angle(fields).cpu().numpy()*(360/(2*np.pi))
-        SLM_field[SLM_field==180.0] = 0 # phase unwrapping
-        SLM_field = np.flip(SLM_field)
-        
-        return SLM_field
 
-    def _forwardMeasure_amp(self, fx_source, fy_source, fz_source, obj, device='cpu'):
-        """
-        From an inner emitting source, this function computes the exit wave.
-        fx_source, fy_source, fz_source: source position in x, y, z
-        obj: obj to be passed through
-        """
-        obj = obj
-
-        self.transmittance = torch.exp(1.0j * self.sigma * obj).to(device)
-
-        u, _, _, fz_illu = self._genSphericalWave(fx_source, fy_source, fz_source, device=device, prop_distance=self.ps_z*1) 
-
-        u = u.to(device)
-        
-        Nz = obj.shape[2]
-        # Multislice
-        if fz_source!=0:
-            Nz -= (np.ceil(fz_source) + 1)
-            Nz = int(Nz)
-        
-        for zz in range(Nz):
-            if fz_source!=0:
-                zz = zz + np.ceil(fz_source) + 1
-                zz = int(zz)
-            u *= self.transmittance[:, :, zz]
-
-            if zz < obj.shape[2] - 1:
-                u = self._propagationAngular(u, self.slice_separation[zz], device=device)
-        
-        # Exit field
-        est_amp = u
-        
-        return est_amp
-        
-
-    def _forwardMeasure(self, fx_source, fy_source, fz_source, obj, device='cpu'):
+    def _forwardMeasure(self, fx_source, fy_source, fz_source, obj, wl_coef=1.0, device='cpu'):
         """
         From an inner emitting source, this function computes the exit wave.
         fx_source, fy_source, fz_source: source position in x, y, z
@@ -200,7 +138,7 @@ class Multislice:
 
         # Compute Forward: multislice propagation
         # u: ifftshifted; complex64; numpy
-        u, _, _, fz_illu = self._genSphericalWave(fx_source, fy_source, fz_source, prop_distance=self.ps_z*1) # initial field
+        u, _, _, fz_illu = self._genSphericalWave(fx_source, fy_source, fz_source, prop_distance=self.ps_z*2, wl_coef=wl_coef) # initial field
         # u, _, _, fz_illu = self._genSphericalWave_old(fx_source, fy_source) # initial field
 
         self.test_spherical.append(u)
@@ -257,45 +195,38 @@ class Multislice:
         field = field_pad[pad:pad_upper, pad:pad_upper]
         
         return field
-    
-    def _genSphericalWave_old(self, fx_source, fy_source, device='cpu'):
-        # ifftshifted
-        fx_source, fy_source = self._setIlluminationOnGrid(fx_source, fy_source)
-        fz_source = self.RI/self.wavelength
 
-        # spherical wave at z = 0
-        r = ((self.xx_shifted-fx_source*self.shape[1])**2+(self.yy_shifted-fy_source*self.shape[0])**2)**0.5
-        
-        r_nonzero = r
-        r_nonzero[r_nonzero < 1e-5 ] = 1  # prevent divide by zero
-        
-        source_xy = torch.exp(1.0j * 2.0 * np.pi / self.wavelength * r_nonzero)/r_nonzero
-        # set the zero value (center coordinate) to 10
-        # source_xy[source_xy == torch.exp(torch.tensor(1.0j * 2.0 * np.pi / self.wavelength))] = 1 # set to 1 now
-
-        return source_xy.to(device), fx_source, fy_source, fz_source
-
-    def _genSphericalWave(self, fx_source, fy_source, fz_depth, prop_distance=0, device='cpu'):
+    def _genSphericalWave(self, fx_source, fy_source, fz_depth, prop_distance=0, wl_coef=1.0, device='cpu'):
         """
         need to be changed according to the depth
         """
         # ifftshifted
         # do not need to adjust the coordinate
         fx_source, fy_source = self._setIlluminationOnGrid(fx_source, fy_source)
+        # fx_source, fy_source = coordinate_transform(fx_source, fy_source, self.shape[0])
         fz_source = self.RI/self.wavelength
         # fz_source = (self.RI/self.wavelength)**2 - self.uxx_shifted**2 - self.uyy_shifted**2
         
         # avoid the problem of divided by 0 when generating spherical wave
         # since we will not put the sources near the surface
         
-        if fz_depth != 0:
+        if fz_depth != 0: 
             dz_prop_distance = self.ps_z + (np.ceil(fz_depth)-fz_depth) * self.ps_z # compute the spherical wave at the next slice (thin)
             r = ((self.xx_shifted-fx_source*self.shape[1])**2+(self.yy_shifted-fy_source*self.shape[0])**2+dz_prop_distance**2)**0.5
     
         else:  # set the source at a certain distance from the bottom of the sample
             r = ((self.xx_shifted-fx_source*self.shape[1])**2+(self.yy_shifted-fy_source*self.shape[0])**2+prop_distance**2)**0.5
+            
+        source_xy = wl_coef * torch.exp(1.0j * 2.0 * np.pi / self.wavelength * r)/r
+        # source_xy = torch.exp(-1.0j * np.pi/self.wavelength /(2*dz_prop_distance)*((self.xx_shifted-fx_source*self.shape[1])**2+(self.yy_shifted-fy_source*self.shape[0])**2))/r
         
-        source_xy = torch.exp(1.0j * 2.0 * np.pi / self.wavelength * r)/r
+        # self.spherical_coef = torch.exp(-1.0j * np.pi/self.wavelength /(-2*dz_prop_distance)*((self.xx_shifted-fx_source*self.shape[1])**2+(self.yy_shifted-fy_source*self.shape[0])**2))*r
+        if fz_depth != 0: 
+            r_point = ((self.xx_shifted-fx_source*self.shape[1])**2+(self.yy_shifted-fy_source*self.shape[0])**2+(dz_prop_distance)**2)**0.5
+            self.spherical_coef = np.exp(1.0j * np.pi/self.wavelength / r * r_point) *r / r_point
+            self.r = r
+            self.r_point = r_point
+            self.form = source_xy*self.spherical_coef
 
         return source_xy.to(device), fx_source, fy_source, fz_source
 
@@ -314,6 +245,7 @@ class Multislice:
         x = (np.arange(shape_x) - shape_x // 2) * (self.ps_x)
         xx, yy = np.meshgrid(x, y)
         xx = np.array(xx)
+        # print(xx)
         yy = np.array(yy)
 
         # spatial frequency sampling
@@ -391,6 +323,104 @@ class Multislice:
         field = field_pad[pad:pad_upper, pad:pad_upper]
         
         return field.to(device)
+
+    def predictSLM(self, fx, fy, fz, obj, gt, focal_length, device='cpu'):
+        """
+        Simulate the wave propagation through the reconstructed sample.
+        Get the corresponding SLM pattern for phase conjugation.
+        focal_length: should be negtive for back propagation
+        """
+        
+        # Step 1: create source field for propagation and get the exit field
+        fields = self._forwardMeasure_amp(fx, fy, fz, obj=obj, device=device)
+        fields = fields/torch.max(torch.abs(fields))
+        
+        """
+        # Step 2: Phase conjugate the field and focus at the distance (-focal length)
+        fields = self._propagationAngular(torch.conj(fields), torch.tensor(-focal_length), device=device)
+        
+        # Step 3: Fourier transform to obtain wavefront at the SLM plane
+        fields = torch.fft.fft2(fields)
+        
+        # Step 4: System limitation
+        fields *= self.pupil
+        
+        fields = torch.fft.fftshift(fields)
+        self.fields_test = fields
+        
+        # Step 5: Mapping to SLM
+        SLM_field = torch.angle(fields).cpu().numpy()*(360/(2*np.pi))
+        SLM_field[SLM_field==180.0] = 0 # phase unwrapping
+        SLM_field = np.flip(SLM_field)
+        """
+        no_pass_fields = self._forwardMeasure_amp(fx, fy, fz, obj=torch.ones_like(obj), device=device)
+        no_pass_fields = no_pass_fields/torch.max(torch.abs(no_pass_fields))
+        
+        self.no_pass_field_back = self._backwardMeasure_amp(no_pass_fields, fx, fy, fz, gt, device=device)
+        SLM_field = self._backwardMeasure_amp(fields, fx, fy, fz, gt, device=device)
+        SLM_field = torch.abs(SLM_field*torch.conj(SLM_field))
+            
+        return SLM_field
+    
+    def _backwardMeasure_amp(self, field, fx_source, fy_source, fz_source, obj, device='cpu'):
+        obj = obj
+        u = field
+        
+        self.transmittance = torch.exp(1.0j * self.sigma * obj).to(device)
+        
+        Nz = obj.shape[2]
+        Nz_o = obj.shape[2]
+        
+        # Multislice
+        if fz_source!=0:
+            Nz -= (np.ceil(fz_source) + 1)
+            Nz = int(Nz)
+        
+        for zz in range(Nz):
+            
+            zz_b = Nz_o - 1 - zz # 0 - 24
+            if zz_b < obj.shape[2] - 1:
+                u = self._propagationAngular(u, -self.slice_separation[zz], device=device)
+            u /= self.transmittance[:, :, zz_b]
+        
+        return u
+        
+        
+    
+    def _forwardMeasure_amp(self, fx_source, fy_source, fz_source, obj, device='cpu'):
+        """
+        From an inner emitting source, this function computes the exit wave.
+        fx_source, fy_source, fz_source: source position in x, y, z
+        obj: obj to be passed through
+        """
+        obj = obj
+
+        self.transmittance = torch.exp(1.0j * self.sigma * obj).to(device)
+
+        u, _, _, fz_illu = self._genSphericalWave(fx_source, fy_source, fz_source, device=device, prop_distance=self.ps_z*1)
+        self.test = u
+
+        u = u.to(device)
+        
+        Nz = obj.shape[2]
+        # Multislice
+        if fz_source!=0:
+            Nz -= (np.ceil(fz_source) + 1)
+            Nz = int(Nz)
+        
+        for zz in range(Nz):
+            if fz_source!=0:
+                zz = zz + np.ceil(fz_source) + 1
+                zz = int(zz)
+            u *= self.transmittance[:, :, zz]
+
+            if zz < obj.shape[2] - 1:
+                u = self._propagationAngular(u, self.slice_separation[zz], device=device)
+        
+        # Exit field
+        est_amp = u
+        
+        return est_amp
 
 
 
